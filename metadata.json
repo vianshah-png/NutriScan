@@ -1,0 +1,7 @@
+{
+  "name": "NutriScan Bill Analyzer",
+  "description": "Scan grocery or restaurant bills to analyze nutritional content, check against medical history, and get healthy alternatives.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
