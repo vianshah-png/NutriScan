@@ -15,7 +15,7 @@ app.use(express.json());
 
 // Initialize AI Providers
 const google = createGoogleGenerativeAI({
-    apiKey: process.env.GEMINI_API_KEY || process.env.API_KEY,
+    apiKey: process.env.GOOGLE_GENERATIVE_AI_API_KEY || process.env.GEMINI_API_KEY || process.env.API_KEY,
 });
 
 const openai = createOpenAI({
