@@ -1,6 +1,8 @@
 import { UserProfile, BillAnalysis, ScanMode } from "../types";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
-// Removed GoogleGenAI import - Frontend is now thin client
+// API Key injected at build time by Vite
+const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY || "";
 
 const TEST_PERSONAS: Record<string, UserProfile> = {
   'TEST-USER-01': {
@@ -85,57 +87,26 @@ export const fetchUserProfile = async (clientId: string): Promise<UserProfile> =
 };
 
 /**
- * Compresses an image and returns it as a base64 data URL.
- * Aggressively sized to stay well under Vercel's 4.5MB payload limit.
+ * Converts a File to a base64 string (without the data URL prefix).
  */
-const compressImageToBase64 = async (file: File, maxSize = 800, quality = 0.6): Promise<string> => {
+const fileToBase64 = (file: File): Promise<string> => {
   return new Promise((resolve, reject) => {
-    const img = new Image();
-    const url = URL.createObjectURL(file);
-
-    img.onload = () => {
-      URL.revokeObjectURL(url);
-
-      let { width, height } = img;
-
-      // Scale down proportionally
-      if (width > maxSize || height > maxSize) {
-        const ratio = Math.min(maxSize / width, maxSize / height);
-        width = Math.round(width * ratio);
-        height = Math.round(height * ratio);
-      }
-
-      const canvas = document.createElement('canvas');
-      canvas.width = width;
-      canvas.height = height;
-
-      const ctx = canvas.getContext('2d');
-      if (!ctx) {
-        reject(new Error('Failed to get canvas context'));
-        return;
-      }
-
-      ctx.drawImage(img, 0, 0, width, height);
-
-      // Get base64 data URL
-      const base64 = canvas.toDataURL('image/jpeg', quality);
-      const sizeKB = Math.round((base64.length * 3) / 4 / 1024); // approx decoded size
-      console.log(`[Frontend] Compressed: ${(file.size / 1024).toFixed(0)}KB → ~${sizeKB}KB base64 (${width}x${height})`);
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result as string;
+      // Remove the data URL prefix (e.g., "data:image/jpeg;base64,")
+      const base64 = result.split(',')[1];
       resolve(base64);
     };
-
-    img.onerror = () => {
-      URL.revokeObjectURL(url);
-      reject(new Error('Failed to load image for compression'));
-    };
-
-    img.src = url;
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
   });
 };
 
 /**
- * Analyzes an image by sending it to the backend endpoint.
- * Uses JSON with base64 image to avoid multipart/form-data overhead.
+ * Analyzes an image by calling Google Gemini API directly from the browser.
+ * This bypasses Vercel's serverless function size limits entirely.
+ * The image goes directly: Browser → Google Gemini API (no middleman).
  */
 export const analyzeImage = async (
   file: File,
@@ -143,55 +114,123 @@ export const analyzeImage = async (
   mode: ScanMode
 ): Promise<BillAnalysis> => {
 
-  // Compress image to base64 to stay under Vercel's 4.5MB limit
-  const imageBase64 = await compressImageToBase64(file);
-  console.log(`[Frontend] Original: ${(file.size / 1024).toFixed(2)} KB, Base64 length: ${(imageBase64.length / 1024).toFixed(2)} KB`);
+  if (!GEMINI_API_KEY) {
+    throw new Error("Gemini API key is not configured. Set VITE_GEMINI_API_KEY in environment variables.");
+  }
 
-  // Send as JSON instead of FormData (much less overhead)
-  const payload = {
-    image: imageBase64,
-    userProfile: userProfile,
-    mode: mode,
-  };
-
-  const API_URL = '/api/analyze';
-
-  console.log(`[Frontend] Preparing to send JSON request to ${API_URL}`);
-  console.log(`[Frontend] Scan Mode: ${mode}, Payload size: ${(JSON.stringify(payload).length / 1024).toFixed(2)} KB`);
+  console.log(`[Frontend] Calling Gemini directly. File: ${file.name} (${(file.size / 1024).toFixed(2)} KB)`);
+  console.log(`[Frontend] Scan Mode: ${mode}, User: ${userProfile.name}`);
 
   const startTime = Date.now();
 
   try {
-    console.log(`[Frontend] Sending fetch request...`);
-    const response = await fetch(API_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
+    // Initialize Gemini
+    const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
 
-    const endTime = Date.now();
-    const duration = endTime - startTime;
-    console.log(`[Frontend] Received response status ${response.status} in ${duration}ms`);
+    // Convert file to base64
+    const base64Data = await fileToBase64(file);
+    console.log(`[Frontend] Image converted to base64 (${(base64Data.length / 1024).toFixed(0)} KB)`);
 
-    if (!response.ok) {
-      const errorData = await response.json();
-      console.error(`[Frontend] Error Response:`, errorData);
-      throw new Error(errorData.error || `Server Error: ${response.status}`);
+    // Build the prompt
+    const systemContext = `
+      You are an expert nutritionist for Balance Nutrition.
+      User Profile: ${userProfile.name}, Location: ${userProfile.location}, Goals: ${userProfile.goals?.join(', ')}, Conditions: ${userProfile.conditions?.join(', ')}, Diet: ${userProfile.dietPreference}.
+    `;
+
+    let taskPrompt = "";
+
+    if (mode === 'RECEIPT') {
+      taskPrompt = `
+      **MODE: RECEIPT/BILL ANALYSIS (Past Tense)**
+      1. **IDENTIFY**: Identify the restaurant (if visible) or store. List all food items purchased.
+      2. **NUTRIENTS**: Extract Macros (Cal, Prot, Carb, Fat) based on standard nutritional data.
+      3. **KEY NUTRIENTS**: IMPORTANT! Highlight specific nutrients relevant to the item and the user's condition.
+          - Example: Diabetic User + Fruit Juice -> Show "Fructose/Added Sugar".
+          - Example: Hypertensive User + Chips -> Show "Sodium".
+      4. **SCORING**: Score the entire bill (0-100) based on how well it fits the user's specific health goals.
+      `;
+    } else {
+      taskPrompt = `
+      **MODE: MENU RECOMMENDATION (Future Tense)**
+      1. **IDENTIFY**: Identify the restaurant from the menu.
+      2. **RECOMMEND**: List the visible dishes in the image.
+      3. **CATEGORIZE**:
+          - 'Good': Best options for this user.
+          - 'Fair': Okay options.
+          - 'Bad': Dishes to avoid (e.g. allergens, breaking diet rules).
+      4. **NUTRIENTS**: Estimate Macros per serving based on standard restaurant recipes.
+      5. **KEY NUTRIENTS**: Highlight specific contents (e.g. "Contains Maida", "High Sodium", "Rich in Fiber").
+      6. **SCORING**: Give a "Suitability Score" (0-100) for how friendly this restaurant is overall for the user.
+      `;
     }
 
-    const analysisData = await response.json();
-    console.log(`[Frontend] Analysis Data Parsed Successfully:`, analysisData);
+    const jsonSchema = `
+    RESPOND ONLY WITH VALID JSON matching this exact schema (no markdown, no code blocks, just raw JSON):
+    {
+      "restaurantName": "string or null",
+      "type": "${mode}",
+      "items": [
+        {
+          "name": "string",
+          "quantity": "string or null",
+          "macros": { "calories": number, "protein": number, "carbs": number, "fat": number },
+          "keyNutrients": [ { "label": "string", "value": "string", "isHigh": boolean } ],
+          "category": "Good" | "Fair" | "Occasional" | "Bad",
+          "reason": "string",
+          "alternatives": ["string"]
+        }
+      ],
+      "totalMacros": { "calories": number, "protein": number, "carbs": number, "fat": number },
+      "healthScore": number (0-100),
+      "summary": "string"
+    }`;
+
+    const fullPrompt = `${systemContext}\n${taskPrompt}\n${jsonSchema}`;
+
+    // Call Gemini with the image
+    console.log(`[Frontend] Sending to Gemini API...`);
+    const result = await model.generateContent([
+      fullPrompt,
+      {
+        inlineData: {
+          mimeType: file.type || 'image/jpeg',
+          data: base64Data,
+        },
+      },
+    ]);
+
+    const duration = Date.now() - startTime;
+    console.log(`[Frontend] Gemini responded in ${duration}ms`);
+
+    const responseText = result.response.text();
+    console.log(`[Frontend] Raw response (first 500 chars):`, responseText.substring(0, 500));
+
+    // Parse JSON from response (handle potential markdown wrapping)
+    let cleanJson = responseText.trim();
+    if (cleanJson.startsWith('```json')) {
+      cleanJson = cleanJson.slice(7);
+    } else if (cleanJson.startsWith('```')) {
+      cleanJson = cleanJson.slice(3);
+    }
+    if (cleanJson.endsWith('```')) {
+      cleanJson = cleanJson.slice(0, -3);
+    }
+    cleanJson = cleanJson.trim();
+
+    const analysisData = JSON.parse(cleanJson);
+    console.log(`[Frontend] Parsed analysis data:`, analysisData);
 
     // Hydrate with client-side IDs
     return {
       ...analysisData,
       id: crypto.randomUUID(),
       date: new Date().toISOString(),
-      type: mode
+      type: mode,
     };
 
-  } catch (error) {
-    console.error("[Frontend] API Call Failed", error);
-    throw new Error("Failed to connect to analysis server. Ensure Node.js backend is running.");
+  } catch (error: any) {
+    console.error("[Frontend] Gemini API Call Failed:", error);
+    throw new Error(`Analysis failed: ${error.message || 'Unknown error'}`);
   }
 };
