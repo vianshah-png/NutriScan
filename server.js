@@ -195,6 +195,14 @@ app.post('/api/analyze', upload.single('image'), async (req, res) => {
     }
 });
 
-app.listen(port, () => {
-    console.log(`NutriScan API Server listening on port ${port}`);
-});
+import { fileURLToPath } from 'url';
+
+// Export the Express app for Vercel
+export default app;
+
+// Only listen if running locally (not imported)
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+    app.listen(port, () => {
+        console.log(`NutriScan API Server listening on port ${port}`);
+    });
+}
