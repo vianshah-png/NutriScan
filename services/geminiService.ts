@@ -85,10 +85,10 @@ export const fetchUserProfile = async (clientId: string): Promise<UserProfile> =
 };
 
 /**
- * Compresses an image file to stay under Vercel's 4.5MB payload limit.
- * Resizes to max 1200px on longest side and compresses to JPEG quality 0.7.
+ * Compresses an image and returns it as a base64 data URL.
+ * Aggressively sized to stay well under Vercel's 4.5MB payload limit.
  */
-const compressImage = async (file: File, maxWidth = 1200, maxHeight = 1200, quality = 0.7): Promise<File> => {
+const compressImageToBase64 = async (file: File, maxSize = 800, quality = 0.6): Promise<string> => {
   return new Promise((resolve, reject) => {
     const img = new Image();
     const url = URL.createObjectURL(file);
@@ -98,9 +98,9 @@ const compressImage = async (file: File, maxWidth = 1200, maxHeight = 1200, qual
 
       let { width, height } = img;
 
-      // Scale down if needed
-      if (width > maxWidth || height > maxHeight) {
-        const ratio = Math.min(maxWidth / width, maxHeight / height);
+      // Scale down proportionally
+      if (width > maxSize || height > maxSize) {
+        const ratio = Math.min(maxSize / width, maxSize / height);
         width = Math.round(width * ratio);
         height = Math.round(height * ratio);
       }
@@ -117,22 +117,11 @@ const compressImage = async (file: File, maxWidth = 1200, maxHeight = 1200, qual
 
       ctx.drawImage(img, 0, 0, width, height);
 
-      canvas.toBlob(
-        (blob) => {
-          if (!blob) {
-            reject(new Error('Failed to compress image'));
-            return;
-          }
-          const compressedFile = new File([blob], file.name.replace(/\.\w+$/, '.jpg'), {
-            type: 'image/jpeg',
-            lastModified: Date.now(),
-          });
-          console.log(`[Frontend] Compressed: ${(file.size / 1024).toFixed(0)}KB → ${(compressedFile.size / 1024).toFixed(0)}KB (${width}x${height})`);
-          resolve(compressedFile);
-        },
-        'image/jpeg',
-        quality
-      );
+      // Get base64 data URL
+      const base64 = canvas.toDataURL('image/jpeg', quality);
+      const sizeKB = Math.round((base64.length * 3) / 4 / 1024); // approx decoded size
+      console.log(`[Frontend] Compressed: ${(file.size / 1024).toFixed(0)}KB → ~${sizeKB}KB base64 (${width}x${height})`);
+      resolve(base64);
     };
 
     img.onerror = () => {
@@ -145,8 +134,8 @@ const compressImage = async (file: File, maxWidth = 1200, maxHeight = 1200, qual
 };
 
 /**
- * Analyzes an image by sending it to the Node.js backend endpoint.
- * This makes the frontend lightweight and mobile-app ready.
+ * Analyzes an image by sending it to the backend endpoint.
+ * Uses JSON with base64 image to avoid multipart/form-data overhead.
  */
 export const analyzeImage = async (
   file: File,
@@ -154,21 +143,21 @@ export const analyzeImage = async (
   mode: ScanMode
 ): Promise<BillAnalysis> => {
 
-  // Compress image to stay under Vercel's 4.5MB payload limit
-  const compressedFile = await compressImage(file);
-  console.log(`[Frontend] Original: ${(file.size / 1024).toFixed(2)} KB, Compressed: ${(compressedFile.size / 1024).toFixed(2)} KB`);
+  // Compress image to base64 to stay under Vercel's 4.5MB limit
+  const imageBase64 = await compressImageToBase64(file);
+  console.log(`[Frontend] Original: ${(file.size / 1024).toFixed(2)} KB, Base64 length: ${(imageBase64.length / 1024).toFixed(2)} KB`);
 
-  // Prepare FormData for the API Endpoint
-  const formData = new FormData();
-  formData.append('image', compressedFile);
-  formData.append('userProfile', JSON.stringify(userProfile));
-  formData.append('mode', mode);
+  // Send as JSON instead of FormData (much less overhead)
+  const payload = {
+    image: imageBase64,
+    userProfile: userProfile,
+    mode: mode,
+  };
 
-  // Call the Node.js Microservice
   const API_URL = '/api/analyze';
 
-  console.log(`[Frontend] Preparing to send request to ${API_URL}`);
-  console.log(`[Frontend] Scan Mode: ${mode}, File: ${file.name} (${(file.size / 1024).toFixed(2)} KB)`);
+  console.log(`[Frontend] Preparing to send JSON request to ${API_URL}`);
+  console.log(`[Frontend] Scan Mode: ${mode}, Payload size: ${(JSON.stringify(payload).length / 1024).toFixed(2)} KB`);
 
   const startTime = Date.now();
 
@@ -176,7 +165,8 @@ export const analyzeImage = async (
     console.log(`[Frontend] Sending fetch request...`);
     const response = await fetch(API_URL, {
       method: 'POST',
-      body: formData,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
     });
 
     const endTime = Date.now();

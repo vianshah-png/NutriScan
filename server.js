@@ -17,7 +17,7 @@ const scanHistory = [];
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '4.5mb' }));
 
 /**
  * GET /api/results
@@ -59,13 +59,25 @@ app.post('/api/analyze', upload.single('image'), async (req, res) => {
     console.log(`[${new Date().toISOString()}] Received analysis request`);
 
     try {
-        if (!req.file) {
-            return res.status(400).json({ error: "No image file provided" });
-        }
+        // Support both JSON (base64) and FormData (file upload)
+        let imageBuffer;
+        let userProfile;
+        let mode;
 
-        // Parse Metadata
-        const userProfile = JSON.parse(req.body.userProfile || '{}');
-        const mode = req.body.mode || 'RECEIPT';
+        if (req.file) {
+            // FormData upload (mobile apps / legacy)
+            imageBuffer = req.file.buffer;
+            userProfile = JSON.parse(req.body.userProfile || '{}');
+            mode = req.body.mode || 'RECEIPT';
+        } else if (req.body.image) {
+            // JSON with base64 image (web frontend)
+            const base64Data = req.body.image.replace(/^data:image\/\w+;base64,/, '');
+            imageBuffer = Buffer.from(base64Data, 'base64');
+            userProfile = typeof req.body.userProfile === 'string' ? JSON.parse(req.body.userProfile) : (req.body.userProfile || {});
+            mode = req.body.mode || 'RECEIPT';
+        } else {
+            return res.status(400).json({ error: "No image provided" });
+        }
 
         console.log(`Processing ${mode} for user: ${userProfile.name || 'Anonymous'}`);
 
@@ -162,7 +174,7 @@ app.post('/api/analyze', upload.single('image'), async (req, res) => {
                     role: 'user',
                     content: [
                         { type: 'text', text: prompt },
-                        { type: 'image', image: req.file.buffer }
+                        { type: 'image', image: imageBuffer }
                     ]
                 }
             ]

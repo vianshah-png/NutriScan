@@ -1,5 +1,4 @@
 import express from 'express';
-import multer from 'multer';
 import cors from 'cors';
 import { generateObject } from 'ai';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
@@ -7,11 +6,10 @@ import { createOpenAI } from '@ai-sdk/openai';
 import { z } from 'zod';
 
 const app = express();
-const upload = multer({ storage: multer.memoryStorage() });
 
-// Middleware
+// Middleware - increase JSON body limit to 4.5MB (Vercel's max)
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '4.5mb' }));
 
 // Initialize AI Providers
 const google = createGoogleGenerativeAI({
@@ -29,21 +27,23 @@ app.get('/api/health', (req, res) => {
 
 /**
  * POST /api/analyze
- * Serverless endpoint for analyzing food/receipt images.
+ * Accepts JSON body with base64-encoded image.
+ * Body: { image: "data:image/jpeg;base64,...", userProfile: {...}, mode: "RECEIPT"|"MENU" }
  */
-app.post('/api/analyze', upload.single('image'), async (req, res) => {
+app.post('/api/analyze', async (req, res) => {
     console.log(`[${new Date().toISOString()}] Received analysis request`);
 
     try {
-        if (!req.file) {
-            return res.status(400).json({ error: "No image file provided" });
+        const { image, userProfile, mode } = req.body;
+
+        if (!image) {
+            return res.status(400).json({ error: "No image provided" });
         }
 
-        // Parse Metadata
-        const userProfile = JSON.parse(req.body.userProfile || '{}');
-        const mode = req.body.mode || 'RECEIPT';
+        const profile = typeof userProfile === 'string' ? JSON.parse(userProfile) : (userProfile || {});
+        const scanMode = mode || 'RECEIPT';
 
-        console.log(`Processing ${mode} for user: ${userProfile.name || 'Anonymous'}`);
+        console.log(`Processing ${scanMode} for user: ${profile.name || 'Anonymous'}`);
 
         // Get AI Provider from Env or Request
         const providerName = process.env.AI_PROVIDER || 'google';
@@ -58,12 +58,12 @@ app.post('/api/analyze', upload.single('image'), async (req, res) => {
         // --- PROMPT ENGINEERING ---
         const systemContext = `
             You are an expert nutritionist for Balance Nutrition.
-            User Profile: ${userProfile.name}, Location: ${userProfile.location}, Goals: ${userProfile.goals?.join(', ')}, Conditions: ${userProfile.conditions?.join(', ')}, Diet: ${userProfile.dietPreference}.
+            User Profile: ${profile.name}, Location: ${profile.location}, Goals: ${profile.goals?.join(', ')}, Conditions: ${profile.conditions?.join(', ')}, Diet: ${profile.dietPreference}.
         `;
 
         let taskPrompt = "";
 
-        if (mode === 'RECEIPT') {
+        if (scanMode === 'RECEIPT') {
             taskPrompt = `
             **MODE: RECEIPT/BILL ANALYSIS (Past Tense)**
             1. **IDENTIFY**: Identify the restaurant (if visible) or store. List all food items purchased.
@@ -125,6 +125,10 @@ app.post('/api/analyze', upload.single('image'), async (req, res) => {
         console.log(`[${new Date().toISOString()}] Sending request to AI Provider (${providerName})...`);
         const startTime = Date.now();
 
+        // Convert base64 data URL to buffer for the AI SDK
+        const base64Data = image.replace(/^data:image\/\w+;base64,/, '');
+        const imageBuffer = Buffer.from(base64Data, 'base64');
+
         // Call Vercel AI SDK
         const result = await generateObject({
             model: model,
@@ -134,7 +138,7 @@ app.post('/api/analyze', upload.single('image'), async (req, res) => {
                     role: 'user',
                     content: [
                         { type: 'text', text: prompt },
-                        { type: 'image', image: req.file.buffer }
+                        { type: 'image', image: imageBuffer }
                     ]
                 }
             ]
@@ -146,8 +150,8 @@ app.post('/api/analyze', upload.single('image'), async (req, res) => {
         const finalResult = {
             id: crypto.randomUUID(),
             timestamp: new Date().toISOString(),
-            user: userProfile.name || 'Anonymous',
-            mode: mode,
+            user: profile.name || 'Anonymous',
+            mode: scanMode,
             ...result.object
         };
 
